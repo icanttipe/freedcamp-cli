@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""freedcamp - Freedcamp CLI"""
+
+import argparse
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.request
+import urllib.parse
+
+VERSION = "1.0.0"
+BASE_URL = "https://freedcamp.com/api/v1"
+
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+
+def config_dir():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "freedcamp")
+
+
+def config_file():
+    return os.path.join(config_dir(), "config.json")
+
+
+def load_config():
+    path = config_file()
+    if not os.path.exists(path):
+        print(f"Config not found: {path}", file=sys.stderr)
+        print("Run 'freedcamp init' to configure.", file=sys.stderr)
+        sys.exit(1)
+    mode = os.stat(path).st_mode & 0o777
+    if mode & 0o077:
+        print(f"Warning: {path} is accessible by others (mode {oct(mode)}).", file=sys.stderr)
+        print("Run: chmod 600 " + path, file=sys.stderr)
+        sys.exit(1)
+    with open(path) as f:
+        return json.load(f)
+
+
+# ─── API ─────────────────────────────────────────────────────────────────────
+
+def auth_params(cfg):
+    ts = str(int(time.time()))
+    msg = cfg["api_key"] + ts
+    h = hmac.new(cfg["api_secret"].encode(), msg.encode(), hashlib.sha1).hexdigest()
+    return {"api_key": cfg["api_key"], "timestamp": ts, "hash": h}
+
+
+def api_request(cfg, method, endpoint, params=None, data=None):
+    query = auth_params(cfg)
+    if params:
+        query.update(params)
+    url = f"{BASE_URL}/{endpoint}?{urllib.parse.urlencode(query)}"
+
+    if method == "GET":
+        req = urllib.request.Request(url)
+    elif method == "DELETE":
+        req = urllib.request.Request(url, method="DELETE")
+    else:
+        boundary = f"----Freedcamp{secrets.token_hex(16)}"
+        body = f"--{boundary}\r\nContent-Disposition: form-data; name=\"data\"\r\n\r\n{json.dumps(data)}\r\n--{boundary}--\r\n"
+        req = urllib.request.Request(url, data=body.encode(), method="POST")
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode(errors="replace")
+        try:
+            err = json.loads(err_body)
+            print(f"API error {e.code}: {err.get('msg', err_body)}", file=sys.stderr)
+        except json.JSONDecodeError:
+            print(f"API error {e.code}: {err_body[:200]}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"Connection error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+
+    if result.get("http_code", 200) != 200:
+        print(f"API error: {result.get('msg', 'Unknown error')}", file=sys.stderr)
+        sys.exit(1)
+
+    return result
+
+
+def api_get(cfg, endpoint, **params):
+    return api_request(cfg, "GET", endpoint, params=params)
+
+
+def api_post(cfg, endpoint, **data):
+    return api_request(cfg, "POST", endpoint, data=data)
+
+
+def api_delete(cfg, endpoint):
+    return api_request(cfg, "DELETE", endpoint)
+
+
+# ─── Commands ────────────────────────────────────────────────────────────────
+
+def cmd_init(_args):
+    path = config_file()
+    if os.path.exists(path):
+        print(f"Config already exists: {path}", file=sys.stderr)
+        sys.exit(1)
+    os.makedirs(config_dir(), mode=0o700, exist_ok=True)
+    key = input("API Key: ").strip()
+    secret = input("API Secret: ").strip()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"api_key": key, "api_secret": secret}, f, indent=2)
+        f.write("\n")
+    print(f"Config saved to {path}")
+
+
+def cmd_projects(args):
+    cfg = load_config()
+    resp = api_get(cfg, "sessions/current")
+    for p in resp["data"].get("projects", []):
+        print(f"{p['project_id']:>10}  {p['project_name']}")
+
+
+def cmd_tasks(args):
+    cfg = load_config()
+    resp = api_get(cfg, "tasks", project_id=args.project_id, limit="200")
+    tasks = resp["data"].get("tasks", [])
+
+    parents = [t for t in tasks if not t["h_parent_id"]]
+    children = {}
+    for t in tasks:
+        if t["h_parent_id"]:
+            children.setdefault(t["h_parent_id"], []).append(t)
+
+    icons = {0: "○", 1: "✓", 2: "◐"}
+    found = False
+    for p in parents:
+        if not args.all and p["status"] == 1:
+            continue
+        found = True
+        s = icons.get(p["status"], "?")
+        print(f"{s} [{p['id']}] {p['title']}")
+        for c in children.get(p["id"], []):
+            if not args.all and c["status"] == 1:
+                continue
+            cs = icons.get(c["status"], "?")
+            print(f"  {cs} [{c['id']}] {c['title']}")
+    if not found:
+        print("No tasks found.")
+
+
+def cmd_task(args):
+    cfg = load_config()
+    resp = api_get(cfg, f"tasks/{args.task_id}")
+    t = resp["data"]["tasks"][0]
+    icons = {0: "Not started", 1: "Completed", 2: "In Progress"}
+    print(f"Title:    {t['title']}")
+    print(f"Status:   {icons.get(t['status'], t['status'])}")
+    print(f"Priority: {t['priority_title']}")
+    print(f"Assigned: {t.get('assigned_to_fullname', 'N/A')}")
+    if t.get("start_ts") or t.get("due_ts"):
+        from datetime import datetime as dt
+    if t.get("start_ts"):
+        print(f"Start:    {dt.fromtimestamp(t['start_ts']).strftime('%Y-%m-%d')}")
+    if t.get("due_ts"):
+        print(f"Due:      {dt.fromtimestamp(t['due_ts']).strftime('%Y-%m-%d')}")
+    if t.get("description"):
+        print(f"Desc:     {t['description']}")
+    print(f"URL:      {t['url']}")
+
+
+def cmd_create(args):
+    cfg = load_config()
+    data = {
+        "title": args.title,
+        "project_id": args.project,
+        "priority": args.priority or "0",
+        "assigned_to_id": args.assign or "0",
+    }
+    if args.group:
+        data["task_group_id"] = args.group
+    if args.desc:
+        data["description"] = args.desc
+    if args.start:
+        data["start_date"] = args.start
+    if args.due:
+        data["due_date"] = args.due
+    if args.parent:
+        data["h_parent_id"] = args.parent
+
+    resp = api_request(cfg, "POST", "tasks", data=data)
+    task_id = resp["data"]["tasks"][0]["id"]
+
+    if args.status and args.status != "0":
+        api_post(cfg, f"tasks/{task_id}", status=args.status)
+
+    print(task_id)
+
+
+def cmd_update(args):
+    cfg = load_config()
+    data = {}
+    if args.title:
+        data["title"] = args.title
+    if args.desc:
+        data["description"] = args.desc
+    if args.status:
+        data["status"] = args.status
+    if args.start:
+        data["start_date"] = args.start
+    if args.due:
+        data["due_date"] = args.due
+    if args.assign:
+        data["assigned_to_id"] = args.assign
+    if args.priority:
+        data["priority"] = args.priority
+
+    if not data:
+        print("Nothing to update.", file=sys.stderr)
+        sys.exit(1)
+
+    resp = api_request(cfg, "POST", f"tasks/{args.task_id}", data=data)
+    print(resp["data"]["tasks"][0]["status_title"])
+
+
+def cmd_complete(args):
+    cfg = load_config()
+    resp = api_post(cfg, f"tasks/{args.task_id}", status="1")
+    print(resp["data"]["tasks"][0]["status_title"])
+
+
+def cmd_delete(args):
+    cfg = load_config()
+    api_delete(cfg, f"tasks/{args.task_id}")
+    print("Deleted.")
+
+
+def cmd_raw(args):
+    cfg = load_config()
+    if args.method == "GET":
+        params = dict(p.split("=", 1) for p in args.data.split("&") if "=" in p) if args.data else {}
+        resp = api_get(cfg, args.endpoint, **params)
+    elif args.method == "POST":
+        try:
+            data = json.loads(args.data) if args.data else {}
+        except json.JSONDecodeError as e:
+            print(f"Invalid JSON: {e}", file=sys.stderr)
+            sys.exit(1)
+        resp = api_request(cfg, "POST", args.endpoint, data=data)
+    elif args.method == "DELETE":
+        resp = api_delete(cfg, args.endpoint)
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+
+
+# ─── CLI ─────────────────────────────────────────────────────────────────────
+
+HELP = f"""\
+freedcamp {VERSION} - CLI for Freedcamp project management
+
+Usage: freedcamp <command> [options]
+
+Commands:
+  init                        Configure API credentials
+  projects                    List all projects
+  tasks <project_id> [--all]  List tasks (--all includes completed)
+  task <task_id>              Show task details
+  create [options]            Create a task
+  update <task_id> [options]  Update a task
+  complete <task_id>          Mark task as completed
+  delete <task_id>            Delete a task
+  raw <method> <endpoint>     Raw API call
+
+Run 'freedcamp <command> --help' for details on a specific command.
+
+Config: {os.path.join(os.environ.get("XDG_CONFIG_HOME", "~/.config"), "freedcamp", "config.json")}
+"""
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="freedcamp",
+        usage="freedcamp <command> [options]",
+        add_help=False,
+    )
+    parser.add_argument("-h", "--help", action="store_true")
+    parser.add_argument("-v", "--version", action="store_true")
+    sub = parser.add_subparsers(dest="command")
+
+    # init
+    sub.add_parser("init", description="Configure API credentials")
+
+    # projects
+    sub.add_parser("projects", description="List all projects")
+
+    # tasks
+    p_tasks = sub.add_parser("tasks", description="List tasks for a project")
+    p_tasks.add_argument("project_id", help="Project ID")
+    p_tasks.add_argument("--all", action="store_true", help="Include completed tasks")
+
+    # task
+    p_task = sub.add_parser("task", description="Show task details")
+    p_task.add_argument("task_id", help="Task ID")
+
+    # create
+    p_create = sub.add_parser("create", description="Create a task")
+    p_create.add_argument("-p", "--project", required=True, help="Project ID")
+    p_create.add_argument("-t", "--title", required=True, help="Task title")
+    p_create.add_argument("-g", "--group", help="Task group ID")
+    p_create.add_argument("-d", "--desc", help="Description")
+    p_create.add_argument("-a", "--assign", help="Assign to user ID")
+    p_create.add_argument("--start", help="Start date (YYYY-MM-DD)")
+    p_create.add_argument("--due", help="Due date (YYYY-MM-DD)")
+    p_create.add_argument("--parent", help="Parent task ID (subtask)")
+    p_create.add_argument("--priority", choices=["0", "1", "2", "3"], help="Priority (0=none,1=low,2=med,3=high)")
+    p_create.add_argument("--status", choices=["0", "1", "2"], help="Status (0=todo,1=done,2=in progress)")
+
+    # update
+    p_update = sub.add_parser("update", description="Update a task")
+    p_update.add_argument("task_id", help="Task ID")
+    p_update.add_argument("-t", "--title", help="New title")
+    p_update.add_argument("-d", "--desc", help="New description")
+    p_update.add_argument("-s", "--status", choices=["0", "1", "2"], help="Status")
+    p_update.add_argument("--start", help="Start date (YYYY-MM-DD)")
+    p_update.add_argument("--due", help="Due date (YYYY-MM-DD)")
+    p_update.add_argument("-a", "--assign", help="Assign to user ID")
+    p_update.add_argument("--priority", choices=["0", "1", "2", "3"], help="Priority")
+
+    # complete
+    p_complete = sub.add_parser("complete", description="Mark task as completed")
+    p_complete.add_argument("task_id", help="Task ID")
+
+    # delete
+    p_delete = sub.add_parser("delete", description="Delete a task")
+    p_delete.add_argument("task_id", help="Task ID")
+
+    # raw
+    p_raw = sub.add_parser("raw", description="Raw API call")
+    p_raw.add_argument("method", choices=["GET", "POST", "DELETE"], help="HTTP method")
+    p_raw.add_argument("endpoint", help="API endpoint")
+    p_raw.add_argument("data", nargs="?", default="", help="Query params (GET) or JSON data (POST)")
+
+    args = parser.parse_args()
+
+    if args.version:
+        print(f"freedcamp {VERSION}")
+        sys.exit(0)
+
+    if args.help or not args.command:
+        print(HELP, end="")
+        sys.exit(0)
+
+    commands = {
+        "init": cmd_init, "projects": cmd_projects, "tasks": cmd_tasks,
+        "task": cmd_task, "create": cmd_create, "update": cmd_update,
+        "complete": cmd_complete, "delete": cmd_delete, "raw": cmd_raw,
+    }
+    commands[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
